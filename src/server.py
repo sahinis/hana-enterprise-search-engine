@@ -4,6 +4,7 @@ Provides HTTP(S) interfaces
 import base64
 import json
 import logging
+import re
 import sys
 import uuid
 from datetime import datetime
@@ -25,12 +26,17 @@ from column_view import ColumnView
 from config import get_user_name
 from constants import (CONCURRENT_CONNECTIONS, TENANT_ID_MAX_LENGTH,
                        TENANT_PREFIX, TYPES_B64_ENCODE, TYPES_SPATIAL,
-                       DBUserType)
+                       DBUserType, ENTITY_PREFIX)
 from db_connection_pool import (ConnectionPool, Credentials, DBBulkProcessing,
                                 DBConnection)
 from esh_client import EshObject
-from esh_objects import map_query
+from esh_objects import map_query, PropertyInternal
 from request_mapping import map_request
+
+ANNO_RANKING = '@com.sap.vocabularies.Search.v1.Ranking'
+ANNO_WHYFOUND = '@com.sap.vocabularies.Search.v1.WhyFound'
+ANNO_WHEREFOUND = '@com.sap.vocabularies.Search.v1.WhereFound'
+
 
 # run with uvicorn src.server:app --reload
 app = FastAPI()
@@ -479,241 +485,126 @@ def get_search(tenant_id, esh_version, path, req: Request):
 def post_search(tenant_id, esh_version, body=Body(...)):
     return perform_bulk_search(get_esh_version(esh_version), tenant_id, body)
 
-'''
-
-# v2 Search
-@app.post('/v2/search/{tenant_id}/{esh_version:path}')
-async def search_v2(tenant_id, esh_version, queries: List[EshObject]):
-    # esh_query = [IESSearchOptions(w).to_statement()[1:] for w in query]
-    #esh_query = [EshObject.parse_obj(w).to_statement()[1:] for w in queries]
-    #search_object = EshObject.parse_obj(queries)
-    esh_query = [w.to_statement()[1:] for w in queries]
-    return perform_bulk_search(get_esh_version(esh_version), tenant_id, esh_query)
-
-def get_list_of_substrings_term_found(string_subject):
-    startterm = '<TERM>'
-    endterm = '</TERM>'
-    startfound= '<FOUND>'
-    endfound = '</FOUND>'
-    intstart=0
-    strlength=len(string_subject)
-    continueloop = 1
-    found_terms = {}
-
-    while intstart < strlength and continueloop == 1:
-        intindex_startterm=string_subject.find(startterm,intstart)
-        if intindex_startterm != -1: #The substring was found, lets proceed
-            intindex_startterm = intindex_startterm+len(startterm)
-            intindex_endterm = string_subject.find(endterm,intindex_startterm)
-            if intindex_endterm != -1:
-                subsequence=string_subject[intindex_startterm:intindex_endterm]
-                found_terms[subsequence] = []
-                intindex_startfound=string_subject.find(startfound,intindex_endterm)
-                intindex_endfound=string_subject.find(endfound,intindex_endterm)
-                intindex_startterm_next=string_subject.find(startterm,intindex_endterm)
-                while intindex_startterm_next == -1 or intindex_startfound < intindex_startterm_next:
-                    if intindex_startfound != -1 and intindex_endfound != 1:
-                        found=string_subject[intindex_startfound+len(startfound):intindex_endfound]
-                        found_terms[subsequence].append(found)
-                    intindex_startfound=string_subject.find(startfound,intindex_startfound+1)
-                    if intindex_startfound == -1:
-                        break
-                    intindex_endfound=string_subject.find(endfound,intindex_endfound+1)
-                intstart=intindex_endterm+len(endterm)
-            else:
-                continueloop=0
-        else:
-            continueloop=0
-    return found_terms
-
-# Search v21
-@app.post('/v21/search/{tenant_id}/{esh_version:path}')
-async def search_v21(tenant_id, esh_version, query=Body(...)):
-    try:
-        with DBConnection(glob.connection_pools[DBUserType.SCHEMA_MODIFY]) as db:
-            tenant_schema_name = get_tenant_schema_name(tenant_id)
-            sql = f'select top 1 MAPPING from "{tenant_schema_name}"."_MODEL" order by CREATED_AT desc'
-            db.cur.execute(sql)
-            res = db.cur.fetchone()
-            if not (res and len(res) == 1):
-                logging.error('Tenant %s has no entries in the _MODEL table', tenant_id)
-                handle_error('Configuration inconsistent', 500)
-            mapping = json.loads(res[0])
-            # ddl = sqlcreate.mapping_to_ddl(mapping, tenant_schema_name)
-            # for create_view in ddl['views']:
-            #     db.cur.execute(create_view)
-            # sql = f"CALL ESH_CONFIG('{json.dumps(ddl['eshConfig'])}', ?)"
-            esh_mapped_queries = map_request(mapping, query)
-            if 'scope' in esh_mapped_queries:
-                anchor_entity_name = esh_mapped_queries['scope']
-                cv = ColumnView(mapping, anchor_entity_name, tenant_schema_name)
-                # for free style elements in query take by_default
-                if 'comparison_paths' in esh_mapped_queries and 'exist_free_style' not in esh_mapped_queries:
-                    cv.by_path_list([['id']] + esh_mapped_queries['comparison_paths']\
-                        , mapping['views'][anchor_entity_name]['view_name']\
-                        , mapping['views'][anchor_entity_name]['odata_name'])
-                else:
-                    cv.by_default()
-                view, esh_config = cv.data_definition()
-                print(view)
-                print(esh_config)
-                print(cv.selector)
-                db.cur.execute(view)
-                #db.cur.execute(f"CALL ESH_CONFIG('{json.dumps([esh_config])}', ?)")
-                db.cur.callproc('ESH_CONFIG', (json.dumps([esh_config]), None))
-
-        # esh_mapped_queries = map_request(mapping, query)
-        for w in esh_mapped_queries['incoming_requests']:
-            a = EshObject.parse_obj(w)
-            print(a.to_statement())
-        esh_query = [EshObject.parse_obj(w).to_statement()[1:] for w in esh_mapped_queries['incoming_requests']]
-
-
-        # esh_query = [IESSearchOptions(w).to_statement()[1:] for w in query]
-        # return perform_bulk_search(get_esh_version(esh_version), tenant_id, esh_query)
-        search_results = perform_bulk_search(get_esh_version(esh_version), tenant_id, esh_query)
-        for search_result in search_results:
-            if 'value' in search_result:
-                for matched_object in search_result['value']:
-                    odata_name = matched_object['@odata.context'][LENGTH_ODATA_METADATA_PREFIX:]
-                    if 'views' in mapping:
-                        for view_value in mapping['views'].values():
-                            if view_value['odata_name'] == odata_name:
-                                entity_name = view_value['entity_name']
-                                break
-                    data_request = {
-                        entity_name: [
-                            {
-                                'id': matched_object['ID']
-                            }
-                        ]
-                    }
-                    read_data_query = await read_data(tenant_id, data_request)
-                    for key in read_data_query[entity_name][0]:
-                        matched_object[key] = read_data_query[entity_name][0][key]
-                    del matched_object['ID']
-                    del matched_object['@odata.context']
-                    # matched_object = read_data_query[entity_name][0]
-                    matched_object['@esh.context'] = entity_name
-                    if '@com.sap.vocabularies.Search.v1.WhyFound' in matched_object:
-                        why_found_list = []
-                        for key, values in matched_object['@com.sap.vocabularies.Search.v1.WhyFound'].items():
-                            why_found_list.append({
-                                'selector':  mapping['views'][entity_name]['columns'][key]['path'],
-                                'values': values
-                            })
-                        matched_object['@com.sap.vocabularies.Search.v1.WhyFound'] = why_found_list
-                    if '@com.sap.vocabularies.Search.v1.WhereFound' in matched_object\
-                         and matched_object['@com.sap.vocabularies.Search.v1.WhereFound']:
-                        #alias_list = []
-                        where_found = matched_object['@com.sap.vocabularies.Search.v1.WhereFound']
-                        found_terms = get_list_of_substrings_term_found(where_found)
-                        new_where = {}
-                        for term, where_array in found_terms.items():
-                            new_where[term] = []
-                            for item in where_array:
-                                new_where[term].append(mapping['views'][entity_name]['columns'][item]['path'])
-                            #alias_list.append({
-                            #    'alias': [found_property],
-                            #    'selector': mapping['views'][entity_name]['columns'][found_property]['path']
-                            #})
-                        # matched_object["@com.sap.vocabularies.Search.v1.Aliases"] = alias_list
-                        # matched_object["@com.sap.vocabularies.Search.v1.WhereFoundOriginal"] \
-                        # = matched_object["@com.sap.vocabularies.Search.v1.WhereFound"]
-                        matched_object['@com.sap.vocabularies.Search.v1.WhereFound'] = new_where
-                    for connector_statistic \
-                    in search_result['@com.sap.vocabularies.Search.v1.SearchStatistics']['ConnectorStatistics']:
-                        if 'OdataID' in connector_statistic and connector_statistic['OdataID'] == odata_name:
-                            connector_statistic['@esh.context'] = entity_name
-                            del connector_statistic['OdataID']
-        return search_results
-    except Exception as e:
-        return {'error': f'{e}'}
-'''
-
 def get_column_view(mapping, anchor_entity_name, schema_name, path_list):
     view_id = str(uuid.uuid4()).replace('-', '').upper()
     view_name = f'DYNAMICVIEW/{view_id}'
     odata_name = f'DYNAMICVIEW_{view_id}'
     cv = ColumnView(mapping, anchor_entity_name, schema_name)
-    cv.by_path_list(path_list, view_name, odata_name)
+    cv.by_default_and_path_list(path_list, view_name, odata_name)
     return cv
 
 # Query v1
 @app.post('/v1/query/{tenant_id}/{esh_version:path}')
 async def query_v1(tenant_id, esh_version, queries: List[EshObject]):
     schema_name = get_tenant_schema_name(tenant_id)
-    with DBConnection(glob.connection_pools[DBUserType.SCHEMA_MODIFY]) as db:
-        mapping = get_mapping(tenant_id, schema_name)
-        dynamic_views = []
-        configurations = []
+    mapping = get_mapping(tenant_id, schema_name)
+    dynamic_views = {}
+    odata_map = {}
+    esh_queries = []
+    for query in queries:
         uris = []
-        view_ddls = []
-        requested_entity_types = []
-        for query in queries:
-            scopes, pathes = query_mapping.extract_pathes(query)
-            #if len(scopes) != 1:
-            if query.scope is None or not isinstance(query.scope, str):
-                handle_error('Exactly one scope is needed', 400)
-            scope = query.scope
+        configurations = []
+        pathes = query_mapping.extract_pathes(query)
+        if query.scope:
+            if isinstance(query.scope, str):
+                scopes = [query.scope]
+            elif isinstance(query.scope, list):
+                scopes = query.scope
+        else:
+            scopes = []
+        esh_scopes = []
+        for scope in scopes:
             if not scope in mapping['entities']:
                 handle_error(f'unknown entity {scope}', 400)
-            requested_entity_types.append(scope)
+            is_cross_entity = False
+            for path in pathes:
+                is_valid, is_cross = convert.check_path(mapping, mapping['entities'][scope], path)
+                if not is_valid:
+                    handle_error(f'invalid path {path} for entity {scope}', 400)
+                is_cross_entity = is_cross_entity or is_cross
+            #if is_cross_entity:
+                # ToDo: support free-style
             cv = get_column_view(mapping, scope, schema_name, pathes.keys())
-            query.scope = cv.view_name
+            esh_scopes.append(cv.odata_name)
             view_ddl, esh_config = cv.data_definition()
             configurations.append(esh_config['content'])
+            view_map = {k:v for k,_,_,_,v in cv.view_attribute}
+            odata_map['$metadata#' + cv.odata_name] = {'entity_type':scope, 'view_map': view_map}
+            dynamic_views[cv.view_name] = {'ddl': view_ddl}
+            #else:
+            #    esh_scopes.append(mapping['entities'][scope]['table_name'][len(ENTITY_PREFIX):])
             for path in pathes.keys():
                 pathes[path] = cv.column_name_by_path(path)
-            query_mapping.map_query(query, [cv.odata_name], pathes)
-            view_ddls.append(view_ddl)
-            dynamic_views.append(cv.view_name)
-            # search_object = EshObject.parse_obj(query)
-            search_object = map_query(query)
-            search_object.select = ['ID']
-            esh_query = search_object.to_statement()[1:]
-            uris.append(f'/{get_esh_version(esh_version)}/{schema_name}/{esh_query}')
-        for view_ddl in view_ddls:
-            db.cur.execute(view_ddl)
-    with DBConnection(glob.connection_pools[DBUserType.DATA_READ]) as db:
-        params = (json.dumps([{'Configuration': configurations, 'URI': uris}]), None)
+
+        query_mapping.map_query(query, pathes)
+        query.scope = esh_scopes
+        search_object = map_query(query)
+        search_object.select = PropertyInternal(property='ID')
+        esh_query = search_object.to_statement()[1:]
+        uris.append(f'/{get_esh_version(esh_version)}/{schema_name}/{esh_query}')
         logging.info(uris)
+        esh_query = {'URI': uris}
+        if configurations:
+            esh_query['Configuration'] = configurations
+        esh_queries.append(esh_query)
+    if dynamic_views:
+        with DBConnection(glob.connection_pools[DBUserType.SCHEMA_MODIFY]) as db:
+            for dynamic_view in dynamic_views.values():
+                db.cur.execute(dynamic_view['ddl'])
+    with DBConnection(glob.connection_pools[DBUserType.DATA_READ]) as db:
+        params = (json.dumps(esh_queries), None)
         db.cur.callproc('esh_search', params)
         search_results = [json.loads(w[0]) for w in db.cur.fetchall()]
-    with DBConnection(glob.connection_pools[DBUserType.SCHEMA_MODIFY]) as db:
-        for view_name in dynamic_views:
-            sql = f'drop view "{schema_name}"."{view_name}"'
-            db.cur.execute(sql)
+    if dynamic_views:
+        with DBConnection(glob.connection_pools[DBUserType.SCHEMA_MODIFY]) as db:
+            for view_name in dynamic_views:
+                sql = f'drop view "{schema_name}"."{view_name}"'
+                db.cur.execute(sql)
+    read_request = {}
+    for search_result in search_results:
+        if 'error' in search_result:
+            handle_error(json.dumps(search_results))
+        for itm in search_result['value']:
+            if itm['@odata.context'] in odata_map:
+                entity_type = odata_map[itm['@odata.context']]['entity_type']
+            else:
+                entity_type = mapping['tables'][ENTITY_PREFIX + itm['@odata.context'][10:]]['external_path'][0]
+                odata_map[itm['@odata.context']]['entity_type'] = entity_type
+            if not entity_type in read_request:
+                read_request[entity_type] = []
+            read_request[entity_type].append({'id':itm['ID']})
 
-    if [w for w in search_results if 'error' in w]:
-        handle_error(json.dumps(search_results))
-    else:
-        data_request = {}
-        for i, search_result in enumerate(search_results):
-            if 'value' in search_result and search_result['value']:
-                requested_entity_type = requested_entity_types[i]
-                if not requested_entity_type in data_request:
-                    data_request[requested_entity_type] = []
-                for res_item in search_result['value']:
-                    data_request[requested_entity_type].append({'id':res_item['ID']})
-        full_objects = await read_data(tenant_id, data_request, True)
-        full_objects_idx = {}
-        for k, v in full_objects.items():
-            full_objects_idx[k] = {}
-            for i in v:
-                full_objects_idx[k][i['id']] = i
+    full_objects = await read_data(tenant_id, read_request, True)
+    full_objects_idx = {}
+    for k, v in full_objects.items():
+        full_objects_idx[k] = {}
+        for i in v:
+            full_objects_idx[k][i['id']] = i
 
-        results = []
-        for i, search_result in enumerate(search_results):
-            result = {'value': []}
-            if 'value' in search_result and search_result['value']:
-                requested_entity_type = requested_entity_types[i]
-                for res_item in search_result['value']:
-                    result['value'].append(full_objects_idx[requested_entity_type][res_item['ID']])
-            if '@odata.count' in search_result:
-                result['@odata.count'] = search_result['@odata.count']
-            results.append(result)
-        return results
+    results = []
+    for i, search_result in enumerate(search_results):
+        result = {'value': []}
+        for itm in search_result['value']:
+            r = {}
+            if ANNO_RANKING in itm and itm[ANNO_RANKING]:
+                r[ANNO_RANKING] = itm[ANNO_RANKING]
+            if ANNO_WHYFOUND in itm and itm[ANNO_RANKING]:
+                r[ANNO_WHYFOUND] = []
+                for k, v in itm[ANNO_WHYFOUND].items():
+                    wf = {'found': odata_map[itm['@odata.context']]['view_map'][k], 'term': v}
+                    r[ANNO_WHYFOUND].append(wf)
+            if ANNO_WHEREFOUND in itm and itm[ANNO_WHEREFOUND]:
+                wf = itm[ANNO_WHEREFOUND]
+                for prop_name_int in re.findall('(?<=<FOUND>)(.*?)(?=</FOUND>)', itm[ANNO_WHEREFOUND], re.S):
+                    prop_name_ext = '.'.join(odata_map[itm['@odata.context']]['view_map'][prop_name_int])
+                    wf = wf.replace(f'<FOUND>{prop_name_int}</FOUND>', f'<FOUND>{prop_name_ext}</FOUND>')
+            res_item = r | full_objects_idx[odata_map[itm['@odata.context']]['entity_type']][itm['ID']]
+            result['value'].append(res_item)
+        if '@odata.count' in search_result:
+            result['@odata.count'] = search_result['@odata.count']
+        results.append(result)
+    return results
+
 
 @app.get('/{path:path}')
 async def tile_request(path: str, response: Response):
