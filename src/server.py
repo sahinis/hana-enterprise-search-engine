@@ -168,7 +168,7 @@ async def post_model(tenant_id: str, cson = Body(...), simulate: bool = False):
         created_at = datetime.now()
         try:
             mapping = convert.cson_to_mapping(cson)
-            ddl = sqlcreate.mapping_to_ddl(mapping, tenant_schema_name)
+            ddl = sqlcreate.mapping_to_ddl(mapping, tenant_schema_name, int(glob.esh_apiversion[1]))
         except convert.ModelException as e:
             handle_error(str(e), 400)
         try:
@@ -176,7 +176,7 @@ async def post_model(tenant_id: str, cson = Body(...), simulate: bool = False):
             with DBBulkProcessing(glob.connection_pools[DBUserType.SCHEMA_MODIFY], block_size) as db_bulk:
                 try:
                     await db_bulk.execute(ddl['tables'])
-                    await db_bulk.execute(ddl['views'])
+                    await db_bulk.execute(ddl['indices'] + ddl['views'])
                     await db_bulk.commit()
                 except HDBException as e:
                     await db_bulk.rollback()
@@ -201,9 +201,16 @@ def get_mapping(tenant_id, schema_name):
         return glob.mapping[schema_name]
     else:
         with DBConnection(glob.connection_pools[DBUserType.DATA_READ]) as db:
-            sql = f'select top 1 MAPPING from "{schema_name}"."_MODEL" order by CREATED_AT desc'
-            db.cur.execute(sql)
-            res = db.cur.fetchone()
+            try:
+                sql = f'select top 1 MAPPING from "{schema_name}"."_MODEL" order by CREATED_AT desc'
+                db.cur.execute(sql)
+                res = db.cur.fetchone()
+            except HDBException as e:
+                db.cur.connection.rollback()
+                if e.errorcode == 362:
+                    handle_error(f"Tennant id '{tenant_id}' does not exist", 404)
+                else:
+                    handle_error(f'dbapi Error: {e.errorcode}, {e.errortext}')
             if not (res and len(res) == 1):
                 logging.error('Tenant %s has no entries in the _MODEL table', tenant_id)
                 handle_error('Configuration inconsistent', 500)
@@ -489,7 +496,11 @@ def get_column_view(mapping, anchor_entity_name, schema_name, path_list):
     view_id = str(uuid.uuid4()).replace('-', '').upper()
     view_name = f'DYNAMICVIEW/{view_id}'
     odata_name = f'DYNAMICVIEW_{view_id}'
-    cv = ColumnView(mapping, anchor_entity_name, schema_name)
+    anchor_entity = mapping['entities'][anchor_entity_name]
+    if 'annotations' in anchor_entity and '@EnterpriseSearch.enabled' in anchor_entity['annotations'] and anchor_entity['annotations']['@EnterpriseSearch.enabled']:
+        cv = ColumnView(mapping, anchor_entity_name, schema_name, False)
+    else: 
+        cv = ColumnView(mapping, anchor_entity_name, schema_name, True)
     cv.by_default_and_path_list(path_list, view_name, odata_name)
     return cv
 
